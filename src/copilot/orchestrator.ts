@@ -331,29 +331,29 @@ async function processQueue(): Promise<void> {
   processing = true;
 
   while (messageQueue.length > 0) {
-      const item = messageQueue.shift()!;
-      currentSourceChannel = item.sourceChannel;
-      try {
-        // Route the model before executing
-        const routeResult = await resolveModel(item.prompt, currentSessionModel || config.copilotModel, recentTiers, copilotClient);
+    const item = messageQueue.shift()!;
+    currentSourceChannel = item.sourceChannel;
+    try {
+      // Route the model before executing
+      const routeResult = await resolveModel(item.prompt, currentSessionModel || config.copilotModel, recentTiers, copilotClient);
       if (routeResult.switched) {
         console.log(`[max] Auto: switching to ${routeResult.model} (${routeResult.overrideName || routeResult.tier})`);
         config.copilotModel = routeResult.model;
         orchestratorSession = undefined;
         deleteState(ORCHESTRATOR_SESSION_KEY);
       }
-        if (routeResult.tier) {
-          recentTiers.push(routeResult.tier);
-          if (recentTiers.length > 5) recentTiers = recentTiers.slice(-5);
-        }
-        const selection = await getEffectiveSelectionForModel(routeResult.model, copilotClient);
-        lastRouteResult = {
-          ...routeResult,
-          ...(selection.reasoning ? { reasoning: selection.reasoning } : {}),
-          ...(selection.availableReasoningEfforts ? { availableReasoningEfforts: selection.availableReasoningEfforts } : {}),
-        };
+      if (routeResult.tier) {
+        recentTiers.push(routeResult.tier);
+        if (recentTiers.length > 5) recentTiers = recentTiers.slice(-5);
+      }
+      const selection = await getEffectiveSelectionForModel(routeResult.model, copilotClient);
+      lastRouteResult = {
+        ...routeResult,
+        ...(selection.reasoning ? { reasoning: selection.reasoning } : {}),
+        ...(selection.availableReasoningEfforts ? { availableReasoningEfforts: selection.availableReasoningEfforts } : {}),
+      };
 
-        const result = await executeOnSession(item.prompt, item.callback);
+      const result = await executeOnSession(item.prompt, item.callback);
       item.resolve(result);
     } catch (err) {
       item.reject(err);

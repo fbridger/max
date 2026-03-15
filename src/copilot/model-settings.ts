@@ -144,7 +144,7 @@ export function resolveEffectiveReasoningEffort(
 function levenshtein(a: string, b: string): number {
   const rows = a.length + 1;
   const cols = b.length + 1;
-  const dp = Array.from({ length: rows }, () => Array<number>(cols).fill(0));
+  const dp = Array.from({ length: rows }, () => Array.from({ length: cols }, () => 0));
 
   for (let i = 0; i < rows; i++) dp[i][0] = i;
   for (let j = 0; j < cols; j++) dp[0][j] = j;

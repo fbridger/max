@@ -185,9 +185,7 @@ export function createBot(): Bot {
               const label = routeResult.routerMode === "auto"
                 ? `⚡ auto · ${routeResult.model}${routeResult.reasoning ? ` · ${routeResult.reasoning}` : ""}`
                 : `${routeResult.model}${routeResult.reasoning ? ` · ${routeResult.reasoning}` : ""}`;
-              indicatorSuffix = routeResult.routerMode === "auto"
-                ? `\n\n_${label}_`
-                : `\n\n_${label}_`;
+              indicatorSuffix = `\n\n_${label}_`;
             }
             const formatted = toTelegramMarkdown(text) + indicatorSuffix;
             const chunks = chunkMessage(formatted);
