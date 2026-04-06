@@ -6,9 +6,10 @@ import { loadMcpConfig } from "./mcp-config.js";
 import { getSkillDirectories } from "./skills.js";
 import { resetClient } from "./client.js";
 import { getEffectiveSelectionForModel, syncConfiguredReasoning, toSdkReasoningEffort } from "./model-settings.js";
-import { logConversation, getState, setState, deleteState, getMemorySummary, getRecentConversation } from "../store/db.js";
+import { logConversation, getState, setState, deleteState, getMemorySummary, getRecentConversation, getRelevantMemories, runMemoryMaintenance } from "../store/db.js";
 import { SESSIONS_DIR } from "../paths.js";
 import { resolveModel, type Tier, type RouteResult } from "./router.js";
+import { extractAndSaveMemories } from "./memory-extractor.js";
 
 const MAX_RETRIES = 3;
 const RECONNECT_DELAYS_MS = [1_000, 3_000, 10_000];
@@ -66,6 +67,7 @@ let sessionCreatePromise: Promise<CopilotSession> | undefined;
 // Message queue — serializes access to the single persistent session
 type QueuedMessage = {
   prompt: string;
+  attachments?: Array<{ type: "file"; path: string; displayName?: string }>;
   callback: MessageCallback;
   sourceChannel?: "telegram" | "tui";
   resolve: (value: string) => void;
@@ -230,13 +232,22 @@ async function createOrResumeSession(): Promise<CopilotSession> {
   console.log(`[max] Created orchestrator session ${session.sessionId.slice(0, 8)}…`);
 
   // Recover conversation context if available (session was lost, not first run)
-  const recentHistory = getRecentConversation(10);
-  if (recentHistory) {
-    console.log(`[max] Injecting recent conversation context into new session`);
+  const recentHistory = getRecentConversation(30);
+  const recoveryMemorySummary = getMemorySummary();
+  if (recentHistory || recoveryMemorySummary) {
+    console.log(`[max] Injecting recovery context into new session (${recentHistory ? "conversation + " : ""}${recoveryMemorySummary ? "memories" : ""})`);
+    const parts: string[] = [
+      "[System: Session recovered] Your previous session was lost. Absorb this context silently — do NOT respond to it.",
+    ];
+    if (recoveryMemorySummary) {
+      parts.push(`\n## Your Long-Term Memories:\n${recoveryMemorySummary}`);
+    }
+    if (recentHistory) {
+      parts.push(`\n## Recent Conversation (last 30 turns):\n${recentHistory}`);
+    }
+    parts.push("\n(End of recovery context. Wait for the next real message.)");
     try {
-      await session.sendAndWait({
-        prompt: `[System: Session recovered] Your previous session was lost. Here's the recent conversation for context — do NOT respond to these messages, just absorb the context silently:\n\n${recentHistory}\n\n(End of recovery context. Wait for the next real message.)`,
-      }, 60_000);
+      await session.sendAndWait({ prompt: parts.join("\n") }, 60_000);
     } catch (err) {
       console.log(`[max] Context recovery injection failed (non-fatal): ${err instanceof Error ? err.message : err}`);
     }
@@ -270,6 +281,16 @@ export async function initOrchestrator(client: CopilotClient): Promise<void> {
   console.log(`[max] Persistent session mode — conversation history maintained by SDK`);
   startHealthCheck();
 
+  // Run memory maintenance on startup (best-effort)
+  try {
+    const { deduped, pruned, capped } = runMemoryMaintenance();
+    if (deduped + pruned + capped > 0) {
+      console.log(`[max] Memory maintenance: ${deduped} deduped, ${pruned} stale pruned, ${capped} capped`);
+    }
+  } catch (err) {
+    console.log(`[max] Memory maintenance failed (non-fatal): ${err instanceof Error ? err.message : err}`);
+  }
+
   // Eagerly create/resume the orchestrator session
   try {
     await ensureOrchestratorSession();
@@ -279,9 +300,27 @@ export async function initOrchestrator(client: CopilotClient): Promise<void> {
 }
 
 /** Send a prompt on the persistent session, return the response. */
-async function executeOnSession(prompt: string, callback: MessageCallback): Promise<string> {
+async function executeOnSession(
+  prompt: string,
+  callback: MessageCallback,
+  attachments?: Array<{ type: "file"; path: string; displayName?: string }>
+): Promise<string> {
   const session = await ensureOrchestratorSession();
   currentCallback = callback;
+
+  // Inject relevant memories into the prompt (skip for background task results)
+  let enrichedPrompt = prompt;
+  if (!prompt.startsWith("[Background task completed]")) {
+    try {
+      const relevant = getRelevantMemories(prompt, 5);
+      if (relevant.length > 0) {
+        const memBlock = relevant.join("; ");
+        // Cap at 500 chars to avoid prompt bloat
+        const trimmed = memBlock.length > 500 ? memBlock.slice(0, 500) + "…" : memBlock;
+        enrichedPrompt = `[Memory context: ${trimmed}]\n\n${prompt}`;
+      }
+    } catch { /* non-fatal */ }
+  }
 
   let accumulated = "";
   let toolCallExecuted = false;
@@ -300,7 +339,10 @@ async function executeOnSession(prompt: string, callback: MessageCallback): Prom
   });
 
   try {
-    const result = await session.sendAndWait({ prompt }, 300_000);
+    const result = await session.sendAndWait(
+      { prompt: enrichedPrompt, ...(attachments && attachments.length > 0 ? { attachments } : {}) },
+      300_000
+    );
     const finalContent = result?.data?.content || accumulated || "(No response)";
     return finalContent;
   } catch (err) {
@@ -339,8 +381,9 @@ async function processQueue(): Promise<void> {
       if (routeResult.switched) {
         console.log(`[max] Auto: switching to ${routeResult.model} (${routeResult.overrideName || routeResult.tier})`);
         config.copilotModel = routeResult.model;
-        orchestratorSession = undefined;
-        deleteState(ORCHESTRATOR_SESSION_KEY);
+        if (orchestratorSession && currentSessionModel !== routeResult.model) {
+          invalidateOrchestratorSession(`auto-routing switched model to '${routeResult.model}'`);
+        }
       }
       if (routeResult.tier) {
         recentTiers.push(routeResult.tier);
@@ -353,7 +396,7 @@ async function processQueue(): Promise<void> {
         ...(selection.availableReasoningEfforts ? { availableReasoningEfforts: selection.availableReasoningEfforts } : {}),
       };
 
-      const result = await executeOnSession(item.prompt, item.callback);
+      const result = await executeOnSession(item.prompt, item.callback, item.attachments);
       item.resolve(result);
     } catch (err) {
       item.reject(err);
@@ -372,7 +415,8 @@ function isRecoverableError(err: unknown): boolean {
 export async function sendToOrchestrator(
   prompt: string,
   source: MessageSource,
-  callback: MessageCallback
+  callback: MessageCallback,
+  attachments?: Array<{ type: "file"; path: string; displayName?: string }>
 ): Promise<void> {
   const sourceLabel =
     source.type === "telegram" ? "telegram" :
@@ -397,7 +441,7 @@ export async function sendToOrchestrator(
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
       try {
         const finalContent = await new Promise<string>((resolve, reject) => {
-          messageQueue.push({ prompt: taggedPrompt, callback, sourceChannel, resolve, reject });
+          messageQueue.push({ prompt: taggedPrompt, attachments, callback, sourceChannel, resolve, reject });
           processQueue();
         });
         // Deliver response to user FIRST, then log best-effort
@@ -406,6 +450,10 @@ export async function sendToOrchestrator(
         // Log both sides of the conversation after delivery
         try { logConversation(logRole, prompt, sourceLabel); } catch { /* best-effort */ }
         try { logConversation("assistant", finalContent, sourceLabel); } catch { /* best-effort */ }
+        // Silently extract memorable facts from user messages
+        if (logRole === "user") {
+          try { extractAndSaveMemories(prompt); } catch { /* best-effort */ }
+        }
         return;
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);

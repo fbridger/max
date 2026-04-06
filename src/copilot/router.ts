@@ -36,7 +36,7 @@ export interface RouteResult {
 // ---------------------------------------------------------------------------
 
 const DEFAULT_CONFIG: RouterConfig = {
-  enabled: true,
+  enabled: false,
   tierModels: {
     fast: "gpt-4.1",
     standard: "claude-sonnet-4.6",
@@ -59,7 +59,7 @@ const DEFAULT_CONFIG: RouterConfig = {
 // Module-level state
 // ---------------------------------------------------------------------------
 
-let messagesSinceSwitch = 0;
+let messagesSinceSwitch = Infinity;
 
 // Short replies that should inherit the previous turn's tier
 const FOLLOW_UP_PATTERNS = [
@@ -139,7 +139,7 @@ async function classifyMessage(
   // Short follow-ups inherit the previous tier
   if (text.length < 20 && recentTiers.length > 0) {
     const isFollowUp = FOLLOW_UP_PATTERNS.some((p) => lower === p || lower === p + ".");
-    if (isFollowUp) return recentTiers[0];
+    if (isFollowUp) return recentTiers[recentTiers.length - 1];
   }
 
   // LLM classification
@@ -170,7 +170,7 @@ export async function resolveModel(
 
   // Router disabled → manual mode
   if (!config.enabled) {
-    messagesSinceSwitch = 0;
+    messagesSinceSwitch = Infinity;
     return { model: currentModel, tier: null, switched: false, routerMode: "manual" };
   }
 
